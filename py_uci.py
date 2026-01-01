@@ -13,11 +13,12 @@ How to use by importing and supplying a search function:
     import chess
     from chess_uci import UCIEngine
 
-    def my_search(board, limits, stop_event, info_callback):
+    def my_search(board, limits, stop_event, info_callback, options=None):
         # board: chess.Board()
         # limits: dict with keys like 'wtime','btime','winc','binc','movetime','depth','nodes','mate'
         # stop_event: threading.Event that is set when the engine should stop thinking
         # info_callback: function(info_dict) -> None for sending UCI "info" lines (optional)
+        # options: dict of engine options (set via 'setoption')
         #
         # Return a chess.Move or UCI string for the best move.
         return chess.Move.from_uci("e2e4")
@@ -40,19 +41,21 @@ from typing import Callable, Optional, Any, Dict
 import chess
 
 # Types
-SearchFnType = Callable[[chess.Board, Dict[str, Any], threading.Event, Optional[Callable[[Dict[str, Any]], None]]], Any]
+# search_fn signature: (board, limits, stop_event, info_callback, options) -> chess.Move or UCI string
+SearchFnType = Callable[[chess.Board, Dict[str, Any], threading.Event, Optional[Callable[[Dict[str, Any]], None]], Dict[str, Any]], Any]
 
 
 class UCIEngine:
-    def __init__(self, search_fn: Optional[SearchFnType] = None, name: str = "PythonUCIEngine", author: str = "Author", logger: Optional[Callable[[str], None]] = None):
+    def __init__(self, search_fn: Optional[SearchFnType] = None, name: str = "PythonUCIEngine", author: str = "Author", logger: Optional[Callable[[str], None]] = None, FrontendTimer = True):
         """
         Create a UCIEngine.
 
-        search_fn signature: (board, limits, stop_event, info_callback) -> chess.Move or UCI string
+        search_fn signature: (board, limits, stop_event, info_callback, options) -> chess.Move or UCI string
             - board: chess.Board (current position)
             - limits: dict describing search limits (see parse_go)
             - stop_event: threading.Event set when the search should stop
             - info_callback: function(info_dict) to send periodic info lines; optional
+            - options: dict of engine options (as set via `setoption`)
 
         If search_fn is None, the engine will raise NotImplementedError on 'go'.
         """
@@ -62,6 +65,9 @@ class UCIEngine:
         self.logger = logger or (lambda s: None)
         self.board = chess.Board()
         self.options = {}
+        self.frontend_timer = False
+        self._timer_thread: Optional[threading.Thread] = None
+        self._timer_cancel_event: Optional[threading.Event] = None
         self.search_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         self.ponder = False
@@ -69,7 +75,7 @@ class UCIEngine:
         self._search_lock = threading.Lock()
         self._last_info_time = 0.0
 
-    def _default_search_fn(self, board, limits, stop_event, info_callback=None):
+    def _default_search_fn(self, board, limits, stop_event, info_callback=None, options: Optional[Dict[str, Any]] = None):
         raise NotImplementedError("No search function provided. Set search_fn when creating UCIEngine.")
 
     def _send(self, line: str):
@@ -219,12 +225,76 @@ class UCIEngine:
         except Exception:
             traceback.print_exc(file=sys.stderr)
 
-    def set_option(self, name: str, value: str):
+    def set_option(self, name: str, value: str, typ: str = "string"):
         """
         Override to handle options programmatically.
         Default implementation stores them in self.options dict.
         """
-        self.options[name] = {"type": "string", "default": value}
+        # Store the option value and handle known engine options
+        self.options[name] = {"type": typ, "default": value}
+        return
+
+    def _maybe_request_frontend_timer(self, limits: Dict[str, Any]):
+        """If `FrontendTimerOverride` is enabled and the limits are
+        compatible, start an internal timer that will set `stop_event`
+        when the allocated time elapses.
+
+        Compatibility: must not specify `mate`, `depth` or `nodes`.
+        Time allocation policy (simple):
+          - if `movetime` present, use it (milliseconds)
+          - else if side has `wtime`/`btime`, allocate base_time/movestogo + increment
+            (uses `movestogo` if present, otherwise assumes 40 moves remaining)
+        """
+        if not self.frontend_timer:
+            return
+        # incompatible limit types
+        if any(k in limits for k in ("searchmoves", "mate", "depth", "nodes")):
+            return
+        # determine milliseconds to wait
+        ms = None
+        if "movetime" in limits:
+            try:
+                ms = int(limits["movetime"])
+            except Exception:
+                ms = None
+        else:
+            side_key = "wtime" if self.board.turn == chess.WHITE else "btime"
+            inc_key = "winc" if self.board.turn == chess.WHITE else "binc"
+            if side_key in limits:
+                try:
+                    base = int(limits[side_key])
+                    inc = int(limits.get(inc_key, 0))
+                    movestogo = int(limits.get("movestogo", 40) or 40)
+                    ms = max(1, int(base / movestogo) + int(inc))
+                except Exception:
+                    ms = None
+        if ms is None:
+            return
+
+        # Cancel any existing timer
+        try:
+            if self._timer_cancel_event is not None:
+                self._timer_cancel_event.set()
+            # Create a new cancel event and start the timer thread
+            cancel_evt = threading.Event()
+            self._timer_cancel_event = cancel_evt
+
+            def _timer_worker(wait_ms: int, cancel_event: threading.Event):
+                # Wait until either cancelled or time elapses
+                if not cancel_event.wait(wait_ms / 1000.0):
+                    # Time expired; signal the search to stop
+                    try:
+                        self.logger(f"engine timer expired after {wait_ms} ms")
+                        self.stop_event.set()
+                        self._send("info string engine_timer_expired")
+                    except Exception:
+                        traceback.print_exc(file=sys.stderr)
+
+            t = threading.Thread(target=_timer_worker, args=(ms, cancel_evt), daemon=True)
+            self._timer_thread = t
+            t.start()
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
 
     def _cmd_ucinewgame(self):
         # Reset internal state if needed
@@ -288,22 +358,16 @@ class UCIEngine:
                 i += 1
             else:
                 i += 1
-        # Convert milliseconds to seconds for movetime (and general time)
-        # The search function will decide precise use of these numbers.
-        if "movetime" in limits:
-            limits["time"] = limits["movetime"] / 1000.0
-        else:
-            # Provide approximate single-side thinking time if wtime/btime present
-            if self.board.turn == chess.WHITE and "wtime" in limits:
-                limits.setdefault("time", limits["wtime"] / 1000.0)
-            if self.board.turn == chess.BLACK and "btime" in limits:
-                limits.setdefault("time", limits["btime"] / 1000.0)
+        # Time-based fields (e.g. 'wtime', 'btime', 'movetime') are provided
+        # as raw milliseconds per the UCI protocol. We do not convert them
+        # here so that either the engine's search function or an external
+        # frontend timer (if requested) can handle allocation policies.
         return limits
 
     def _cmd_go(self, tokens):
         limits = self._parse_go(tokens)
         self.ponder = bool(limits.get("ponder", False))
-        # Start search thread
+        # Start search thread (internal timer will be started from _start_search)
         self._start_search(limits)
 
     def _start_search(self, limits: Dict[str, Any]):
@@ -313,10 +377,25 @@ class UCIEngine:
             self.stop_event.clear()
             self.search_thread = threading.Thread(target=self._search_worker, args=(limits,), daemon=True)
             self.search_thread.start()
+            # Start internal engine timer if requested and limits are compatible
+            try:
+                self._maybe_request_frontend_timer(limits)
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
 
     def _stop_search(self, wait: bool):
         # Signal stop and optionally wait for thread to finish
         self.stop_event.set()
+        # Cancel any running internal timer
+        try:
+            if self._timer_cancel_event is not None:
+                self._timer_cancel_event.set()
+            if self._timer_thread is not None:
+                tt = self._timer_thread
+                self._timer_thread = None
+                tt.join(timeout=1.0)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
         th = self.search_thread
         self.search_thread = None
         if th is not None and wait:
@@ -349,8 +428,8 @@ class UCIEngine:
                     finally:
                         self._last_info_time = now
 
-            # Call the search function
-            result = self.search_fn(self.board.copy(stack=False), limits, self.stop_event, info_callback)
+            # Call the search function, passing current engine options as a dict
+            result = self.search_fn(self.board.copy(stack=False), limits, self.stop_event, info_callback, dict(self.options))
             if result is None:
                 # No move found (should not happen), return a legal move if any
                 try:
@@ -391,7 +470,7 @@ class UCIEngine:
 if __name__ == "__main__":
     # If run as a script without a search function, the default search_fn raises NotImplementedError.
     # Provide a minimal no-op search that immediately returns a legal move (for testing).
-    def quick_search(board, limits, stop_event, info_callback=None):
+    def quick_search(board, limits, stop_event, info_callback=None, options=None):
         # Very simple: choose the first legal move
         try:
             mv = next(iter(board.legal_moves))
