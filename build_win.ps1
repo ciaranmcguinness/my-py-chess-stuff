@@ -7,7 +7,7 @@ if (Get-Command uv -ErrorAction SilentlyContinue) {
     uv add pyinstaller
 
     Write-Host "Building random_move with PyInstaller..."
-    uv run pyinstaller random_move.py -f
+    pyinstaller --onefile --add-data "py_uci.py;." random_move.py
 
     if ($LASTEXITCODE -ne 0) {
         Write-Host "pyinstaller build failed."

@@ -45,6 +45,97 @@ import chess
 SearchFnType = Callable[[chess.Board, Dict[str, Any], threading.Event, Optional[Callable[[Dict[str, Any]], None]], Dict[str, Any]], Any]
 
 
+class UCIOption:
+    """Represents a UCI engine option with proper type handling and validation."""
+    
+    def __init__(self, name: str, opt_type: str, default=None, min_val=None, max_val=None, var_list=None):
+        """
+        Create a UCI option.
+        
+        Args:
+            name: Option name
+            opt_type: Type of option: 'check', 'spin', 'combo', 'string', or 'button'
+            default: Default value (will be converted to proper type)
+            min_val: Minimum value (for 'spin' type)
+            max_val: Maximum value (for 'spin' type)
+            var_list: List of valid values (for 'combo' type)
+        """
+        self.name = name
+        self.opt_type = opt_type
+        self.min_val = min_val
+        self.max_val = max_val
+        self.var_list = var_list or []
+        
+        # Set and validate default
+        self.default = self._convert_and_validate(default, is_default=True)
+        # Current value starts as the default
+        self.current = self.default
+    
+    def _convert_and_validate(self, value, is_default=False):
+        """Convert value to proper type and validate."""
+        if value is None:
+            if self.opt_type == 'button':
+                return None
+            elif self.opt_type == 'check':
+                return False
+            elif self.opt_type == 'spin':
+                return 0 if self.min_val is None else self.min_val
+            elif self.opt_type in ('combo', 'string'):
+                return ""
+        
+        if self.opt_type == 'button':
+            return None
+        elif self.opt_type == 'check':
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.lower() in ('true', '1', 'yes')
+            return bool(value)
+        elif self.opt_type == 'spin':
+            try:
+                val = int(value)
+                if self.min_val is not None and val < self.min_val:
+                    if is_default:
+                        return self.min_val
+                    raise ValueError(f"Value {val} below minimum {self.min_val}")
+                if self.max_val is not None and val > self.max_val:
+                    if is_default:
+                        return self.max_val
+                    raise ValueError(f"Value {val} above maximum {self.max_val}")
+                return val
+            except (ValueError, TypeError):
+                raise ValueError(f"Expected integer for spin option, got {value}")
+        elif self.opt_type == 'combo':
+            val = str(value)
+            if self.var_list and val not in self.var_list:
+                raise ValueError(f"Value '{val}' not in combo options: {self.var_list}")
+            return val
+        else:  # string
+            return str(value) if value is not None else ""
+    
+    def set_value(self, value):
+        """Set the current value with validation."""
+        self.current = self._convert_and_validate(value, is_default=False)
+    
+    def to_option_command(self) -> str:
+        """Generate the UCI option command for this option."""
+        parts = [f"option name {self.name} type {self.opt_type}"]
+        
+        if self.opt_type != 'button':
+            parts.append(f"default {self.default}")
+        
+        if self.opt_type == 'spin':
+            if self.min_val is not None:
+                parts.append(f"min {self.min_val}")
+            if self.max_val is not None:
+                parts.append(f"max {self.max_val}")
+        elif self.opt_type == 'combo':
+            for var in self.var_list:
+                parts.append(f"var {var}")
+        
+        return " ".join(parts)
+
+
 class UCIEngine:
     def __init__(self, search_fn: Optional[SearchFnType] = None, name: str = "PythonUCIEngine", author: str = "Author", logger: Optional[Callable[[str], None]] = None, FrontendTimer = True):
         """
@@ -64,7 +155,7 @@ class UCIEngine:
         self.search_fn = search_fn or self._default_search_fn
         self.logger = logger or (lambda s: None)
         self.board = chess.Board()
-        self.options = {}
+        self.options: Dict[str, UCIOption] = {}
         self.frontend_timer = False
         self._timer_thread: Optional[threading.Thread] = None
         self._timer_cancel_event: Optional[threading.Event] = None
@@ -177,20 +268,9 @@ class UCIEngine:
     def _cmd_uci(self):
         self._send(f"id name {self.name}")
         self._send(f"id author {self.author}")
-        # options (none by default — user can implement by setting self.options)
-        for opt_name, opt_info in self.options.items():
-            # opt_info can be a dict with keys type, default, min, max, var
-            line = f"option name {opt_name} type {opt_info.get('type','spin')}"
-            if "default" in opt_info:
-                line += f" default {opt_info['default']}"
-            if "min" in opt_info:
-                line += f" min {opt_info['min']}"
-            if "max" in opt_info:
-                line += f" max {opt_info['max']}"
-            if "var" in opt_info:
-                for v in opt_info["var"]:
-                    line += f" var {v}"
-            self._send(line)
+        # Send all registered options
+        for opt_name, opt_obj in self.options.items():
+            self._send(opt_obj.to_option_command())
         self._send("uciok")
 
     def _cmd_isready(self):
@@ -199,7 +279,7 @@ class UCIEngine:
 
     def _cmd_setoption(self, tokens):
         # tokens like: ['name', 'Hash', 'value', '128']
-        # Basic parsing
+        # Parse option name and value
         name = None
         value = None
         i = 0
@@ -216,23 +296,37 @@ class UCIEngine:
                 break
             else:
                 i += 1
+        
         if name is None:
             return
-        self.options[name] = {"type": "string", "default": value}
-        # Allow the host program to watch for options by overriding set_option
+        
+        # If option is registered, use its validation; otherwise create a string option
+        if name in self.options:
+            try:
+                self.options[name].set_value(value)
+            except ValueError as e:
+                self.logger(f"Invalid value for option {name}: {e}")
+        else:
+            # Create a default string option if not registered
+            opt = UCIOption(name, "string", default=value)
+            self.options[name] = opt
+        
+        # Call set_option hook for custom handling
         try:
-            self.set_option(name, value)
+            self.options[name].set_value(value)
+            self.logger(f"Set option {name} to {self.options[name].current}")
         except Exception:
             traceback.print_exc(file=sys.stderr)
-
-    def set_option(self, name: str, value: str, typ: str = "string"):
-        """
-        Override to handle options programmatically.
-        Default implementation stores them in self.options dict.
-        """
-        # Store the option value and handle known engine options
-        self.options[name] = {"type": typ, "default": value}
-        return
+    
+    def register_option(self, name: str, opt_type: str, default=None, min_val=None, max_val=None, var_list=None):
+        """Register a UCI option with the engine before uci command is sent."""
+        self.options[name] = UCIOption(name, opt_type, default, min_val, max_val, var_list)
+    
+    def get_option(self, name: str):
+        """Get the current value of an option, or None if not registered."""
+        if name in self.options:
+            return self.options[name].current
+        return None
 
     def _maybe_request_frontend_timer(self, limits: Dict[str, Any]):
         """If `FrontendTimerOverride` is enabled and the limits are
@@ -428,8 +522,11 @@ class UCIEngine:
                     finally:
                         self._last_info_time = now
 
+            # Build a dict of current option values (not UCIOption objects)
+            current_options = {name: opt.current for name, opt in self.options.items()}
+            
             # Call the search function, passing current engine options as a dict
-            result = self.search_fn(self.board.copy(stack=False), limits, self.stop_event, info_callback, dict(self.options))
+            result = self.search_fn(self.board.copy(stack=False), limits, self.stop_event, info_callback, current_options)
             if result is None:
                 # No move found (should not happen), return a legal move if any
                 try:
